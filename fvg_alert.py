@@ -12,8 +12,12 @@ BARS = 260
 EXPIRY_BARS = 96          # ゾーンの有効期限（15分足96本 = 24時間）
 LOOKBACK_BARS = 4         # 実行が落ちた分を拾うため、直近この本数まで遡ってタッチ判定
 ATR_PERIOD = 14           # 通知に載せるためだけに計算（フィルターには使わない）
+MAX_ALERTS = 8            # 1回の実行で送る通知の上限
+SEND_GAP = 2.0            # 通知の送信間隔（秒）
 
 STATE_FILE = "state.json"
+
+UA = "Mozilla/5.0 (compatible; fvg-alert/1.0)"
 
 TD_KEY = os.environ.get("TD_API_KEY", "")
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
@@ -34,7 +38,7 @@ def fetch_bars():
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0",
+                "User-Agent": UA,
                 "Accept": "application/json",
             })
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -42,12 +46,12 @@ def fetch_bars():
             break
         except Exception as e:
             last_err = e
-            print("attempt %d failed: %s" % (attempt + 1, e))
+            print("fetch attempt %d failed: %s" % (attempt + 1, e))
             if attempt < 2:
                 time.sleep(20)
 
     if data is None:
-        raise RuntimeError("all attempts failed: %s" % last_err)
+        raise RuntimeError("all fetch attempts failed: %s" % last_err)
     if "values" not in data:
         raise RuntimeError("API error: %s" % data.get("message", data))
 
@@ -124,14 +128,30 @@ def touched(zone, bar):
 
 
 def notify(text):
+    """送信できたらTrue。失敗しても例外は投げない。"""
     if not WEBHOOK:
         print("no webhook set:\n" + text)
-        return
+        return False
     body = json.dumps({"content": text}).encode()
-    req = urllib.request.Request(
-        WEBHOOK, data=body, headers={"Content-Type": "application/json"}
-    )
-    urllib.request.urlopen(req, timeout=30).read()
+    req = urllib.request.Request(WEBHOOK, data=body, headers={
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            print("discord: HTTP %d" % r.status)
+        return True
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode()[:300]
+        except Exception:
+            pass
+        print("discord failed: HTTP %d %s" % (e.code, detail))
+        return False
+    except Exception as e:
+        print("discord failed: %s" % e)
+        return False
 
 
 def load_state():
@@ -177,7 +197,8 @@ def main():
                 hits.append((z, k))
                 break
 
-    for z, k in hits:
+    sent = 0
+    for z, k in hits[:MAX_ALERTS]:
         bar = bars[k]
         side = "ロング" if z["side"] == "long" else "ショート"
         delay = "" if k == last else "（%d本前）" % (last - k)
@@ -190,13 +211,19 @@ def main():
             "ゾーン生成: %s"
         ) % (side, delay, z["bottom"], z["top"], bar["t"],
              bars[last]["c"], av or 0.0, z["born_t"])
-        notify(msg)
-        seen.add(z["id"])
-        print("alert: " + z["id"])
+
+        if notify(msg):
+            seen.add(z["id"])
+            sent += 1
+        time.sleep(SEND_GAP)
+
+    rest = len(hits) - min(len(hits), MAX_ALERTS)
+    if rest > 0:
+        notify("他 %d 件のシグナルは省略されました" % rest)
 
     st["notified"] = sorted(seen)
     save_state(st)
-    print("checked %d bars, %d alerts" % (len(bars), len(hits)))
+    print("checked %d bars, %d hits, %d sent" % (len(bars), len(hits), sent))
     return 0
 
 
