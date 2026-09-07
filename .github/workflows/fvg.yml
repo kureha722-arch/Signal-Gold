@@ -21,14 +21,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-　　　　- name: Test webhook
-    　    if: github.event_name == 'workflow_dispatch'
-　        env:
-     　     DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
- 　       run: |
- 　         curl -sS -H "Content-Type: application/json" \
-  　          -d '{"content":"テスト通知 — fvg-alert は動いています"}' \
-　            "$DISCORD_WEBHOOK"
+
+      - name: Test webhook
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          curl -sS -H "Content-Type: application/json" -d '{"content":"テスト通知"}' "$DISCORD_WEBHOOK"
+
       - name: Run check
         env:
           TD_API_KEY: ${{ secrets.TD_API_KEY }}
