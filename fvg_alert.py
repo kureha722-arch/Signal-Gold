@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -9,8 +10,8 @@ INTERVAL = "15min"
 BARS = 260
 
 EXPIRY_BARS = 96          # ゾーンの有効期限（15分足96本 = 24時間）
-MIN_SIZE_ATR = 0.30       # ATRのこの倍率未満のギャップは無視
-ATR_PERIOD = 14
+LOOKBACK_BARS = 4         # 実行が落ちた分を拾うため、直近この本数まで遡ってタッチ判定
+ATR_PERIOD = 14           # 通知に載せるためだけに計算（フィルターには使わない）
 
 STATE_FILE = "state.json"
 
@@ -27,10 +28,29 @@ def fetch_bars():
         "apikey": TD_KEY,
     })
     url = "https://api.twelvedata.com/time_series?" + q
-    with urllib.request.urlopen(url, timeout=30) as r:
-        data = json.loads(r.read().decode())
+
+    data = None
+    last_err = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode())
+            break
+        except Exception as e:
+            last_err = e
+            print("attempt %d failed: %s" % (attempt + 1, e))
+            if attempt < 2:
+                time.sleep(20)
+
+    if data is None:
+        raise RuntimeError("all attempts failed: %s" % last_err)
     if "values" not in data:
         raise RuntimeError("API error: %s" % data.get("message", data))
+
     out = []
     for v in data["values"]:
         out.append({
@@ -58,16 +78,12 @@ def atr(bars, i, period=ATR_PERIOD):
 
 
 def find_zones(bars):
-    """3本のローソク足からFVG（インバランス）を検出する。"""
+    """3本のローソク足からFVG（インバランス）を検出する。サイズによる除外はしない。"""
     zones = []
     for i in range(1, len(bars) - 1):
         a, c = bars[i - 1], bars[i + 1]
-        av = atr(bars, i + 1)
-        if av is None:
-            continue
-        floor = av * MIN_SIZE_ATR
 
-        if a["h"] < c["l"] and (c["l"] - a["h"]) >= floor:
+        if a["h"] < c["l"]:
             zones.append({
                 "id": "L" + bars[i]["t"],
                 "side": "long",
@@ -76,7 +92,7 @@ def find_zones(bars):
                 "born": i + 1,
                 "born_t": bars[i + 1]["t"],
             })
-        elif a["l"] > c["h"] and (a["l"] - c["h"]) >= floor:
+        elif a["l"] > c["h"]:
             zones.append({
                 "id": "S" + bars[i]["t"],
                 "side": "short",
@@ -88,11 +104,11 @@ def find_zones(bars):
     return zones
 
 
-def alive(zone, bars, last):
+def alive(zone, bars, upto):
     """期限切れ・完全な埋め戻しでゾーンを失効させる。"""
-    if last - zone["born"] > EXPIRY_BARS:
+    if upto - zone["born"] > EXPIRY_BARS:
         return False
-    for k in range(zone["born"] + 1, last):
+    for k in range(zone["born"] + 1, upto):
         b = bars[k]
         if zone["side"] == "long" and b["l"] <= zone["bottom"]:
             return False
@@ -143,7 +159,6 @@ def main():
         return 1
 
     last = len(bars) - 1
-    cur = bars[last]
     st = load_state()
     seen = set(st["notified"])
     av = atr(bars, last)
@@ -154,20 +169,27 @@ def main():
             continue
         if z["id"] in seen:
             continue
-        if not alive(z, bars, last):
-            continue
-        if touched(z, cur):
-            hits.append(z)
+        start = max(z["born"] + 1, last - LOOKBACK_BARS + 1)
+        for k in range(start, last + 1):
+            if not alive(z, bars, k):
+                break
+            if touched(z, bars[k]):
+                hits.append((z, k))
+                break
 
-    for z in hits:
+    for z, k in hits:
+        bar = bars[k]
         side = "ロング" if z["side"] == "long" else "ショート"
+        delay = "" if k == last else "（%d本前）" % (last - k)
         msg = (
-            "**%s シグナル — XAUUSD 15分足**\n"
+            "**%s シグナル — XAUUSD 15分足**%s\n"
             "ゾーン: %.2f – %.2f\n"
-            "現在値: %.2f （足: %s）\n"
+            "タッチ足: %s\n"
+            "現在値: %.2f\n"
             "ATR(14): %.2f\n"
             "ゾーン生成: %s"
-        ) % (side, z["bottom"], z["top"], cur["c"], cur["t"], av or 0.0, z["born_t"])
+        ) % (side, delay, z["bottom"], z["top"], bar["t"],
+             bars[last]["c"], av or 0.0, z["born_t"])
         notify(msg)
         seen.add(z["id"])
         print("alert: " + z["id"])
