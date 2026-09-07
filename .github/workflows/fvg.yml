@@ -1,0 +1,38 @@
+name: fvg-alert
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fvg-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run check
+        env:
+          TD_API_KEY: ${{ secrets.TD_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: python fvg_alert.py
+
+      - name: Save state
+        run: |
+          git config user.name "fvg-bot"
+          git config user.email "fvg-bot@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || git commit -m "state"
+          git pull --rebase --autostash || true
+          git push
