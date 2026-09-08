@@ -11,7 +11,9 @@ BARS = 260
 
 EXPIRY_BARS = 96          # ゾーンの有効期限（15分足96本 = 24時間）
 LOOKBACK_BARS = 4         # 実行が落ちた分を拾うため、直近この本数まで遡ってタッチ判定
-ATR_PERIOD = 14           # 通知に載せるためだけに計算（フィルターには使わない）
+ATR_PERIOD = 14
+SL_ATR_BUFFER = 0.5       # 損切りはゾーン端からATR×この倍率だけ離す
+TP_R = 2.0                # 利確はリスク幅のこの倍率
 MAX_ALERTS = 8            # 1回の実行で送る通知の上限
 SEND_GAP = 2.0            # 通知の送信間隔（秒）
 
@@ -82,7 +84,7 @@ def atr(bars, i, period=ATR_PERIOD):
 
 
 def find_zones(bars):
-    """3本のローソク足からFVG（インバランス）を検出する。サイズによる除外はしない。"""
+    """3本のローソク足からFVG（インバランス）を検出する。"""
     zones = []
     for i in range(1, len(bars) - 1):
         a, c = bars[i - 1], bars[i + 1]
@@ -108,15 +110,19 @@ def find_zones(bars):
     return zones
 
 
+def filled(zone, bar):
+    """その足でゾーンを完全に抜けたか。"""
+    if zone["side"] == "long":
+        return bar["l"] <= zone["bottom"]
+    return bar["h"] >= zone["top"]
+
+
 def alive(zone, bars, upto):
-    """期限切れ・完全な埋め戻しでゾーンを失効させる。"""
+    """期限切れ・埋め戻しでゾーンを失効させる（uptoの直前まで判定）。"""
     if upto - zone["born"] > EXPIRY_BARS:
         return False
     for k in range(zone["born"] + 1, upto):
-        b = bars[k]
-        if zone["side"] == "long" and b["l"] <= zone["bottom"]:
-            return False
-        if zone["side"] == "short" and b["h"] >= zone["top"]:
+        if filled(zone, bars[k]):
             return False
     return True
 
@@ -125,6 +131,21 @@ def touched(zone, bar):
     if zone["side"] == "long":
         return bar["l"] <= zone["top"] and bar["h"] >= zone["bottom"]
     return bar["h"] >= zone["bottom"] and bar["l"] <= zone["top"]
+
+
+def levels(zone, av):
+    """エントリー・損切り・利確を計算する。"""
+    if zone["side"] == "long":
+        entry = zone["top"]
+        sl = zone["bottom"] - av * SL_ATR_BUFFER
+        risk = entry - sl
+        tp = entry + risk * TP_R
+    else:
+        entry = zone["bottom"]
+        sl = zone["top"] + av * SL_ATR_BUFFER
+        risk = sl - entry
+        tp = entry - risk * TP_R
+    return entry, sl, tp, risk
 
 
 def notify(text):
@@ -182,8 +203,12 @@ def main():
     st = load_state()
     seen = set(st["notified"])
     av = atr(bars, last)
+    if av is None or av <= 0:
+        print("atr unavailable")
+        return 1
 
     hits = []
+    skipped = 0
     for z in find_zones(bars):
         if z["born"] >= last:
             continue
@@ -194,7 +219,12 @@ def main():
             if not alive(z, bars, k):
                 break
             if touched(z, bars[k]):
-                hits.append((z, k))
+                # 同じ足でゾーンを突き抜けた場合は無効
+                if filled(z, bars[k]):
+                    seen.add(z["id"])
+                    skipped += 1
+                else:
+                    hits.append((z, k))
                 break
 
     sent = 0
@@ -202,15 +232,20 @@ def main():
         bar = bars[k]
         side = "ロング" if z["side"] == "long" else "ショート"
         delay = "" if k == last else "（%d本前）" % (last - k)
+        entry, sl, tp, risk = levels(z, av)
         msg = (
             "**%s シグナル — XAUUSD 15分足**%s\n"
-            "ゾーン: %.2f – %.2f\n"
-            "タッチ足: %s\n"
-            "現在値: %.2f\n"
+            "ゾーン: %.2f – %.2f （幅 %.2f）\n"
+            "エントリー: %.2f\n"
+            "損切り: %.2f\n"
+            "利確: %.2f\n"
+            "リスク幅: %.2f（1ロットあたり $%.0f）\n"
             "ATR(14): %.2f\n"
+            "タッチ足: %s ／ 現在値: %.2f\n"
             "ゾーン生成: %s"
-        ) % (side, delay, z["bottom"], z["top"], bar["t"],
-             bars[last]["c"], av or 0.0, z["born_t"])
+        ) % (side, delay, z["bottom"], z["top"], z["top"] - z["bottom"],
+             entry, sl, tp, risk, risk * 100, av,
+             bar["t"], bars[last]["c"], z["born_t"])
 
         if notify(msg):
             seen.add(z["id"])
@@ -223,7 +258,8 @@ def main():
 
     st["notified"] = sorted(seen)
     save_state(st)
-    print("checked %d bars, %d hits, %d sent" % (len(bars), len(hits), sent))
+    print("checked %d bars, %d hits, %d sent, %d skipped(filled)"
+          % (len(bars), len(hits), sent, skipped))
     return 0
 
 
