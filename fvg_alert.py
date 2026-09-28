@@ -18,6 +18,8 @@ MAX_ALERTS = 8            # 1回の実行で送る通知の上限
 SEND_GAP = 2.0            # 通知の送信間隔（秒）
 
 STATE_FILE = "state.json"
+LOG_FILE = "signals.csv"    # 全シグナルの記録（検証用）
+BARS_FILE = "bars.csv"      # 取得した15分足の蓄積（検証用）
 
 UA = "Mozilla/5.0 (compatible; fvg-alert/1.0)"
 
@@ -175,6 +177,37 @@ def notify(text):
         return False
 
 
+def log_signal(z, bar, status, entry, sl, tp, av):
+    """シグナルを1行ずつsignals.csvに追記する。"""
+    new = not os.path.exists(LOG_FILE)
+    with open(LOG_FILE, "a") as f:
+        if new:
+            f.write("zone_id,side,status,born_t,touch_t,bottom,top,entry,sl,tp,atr\n")
+        f.write("%s,%s,%s,%s,%s,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n" % (
+            z["id"], z["side"], status, z["born_t"], bar["t"],
+            z["bottom"], z["top"], entry, sl, tp, av))
+
+
+def save_bars(bars):
+    """確定済みの足をbars.csvに重複なく蓄積する（最後の未確定足は除く）。"""
+    rows = {}
+    try:
+        with open(BARS_FILE) as f:
+            next(f)
+            for line in f:
+                p = line.strip().split(",")
+                if len(p) == 5:
+                    rows[p[0]] = line.strip()
+    except Exception:
+        pass
+    for b in bars[:-1]:
+        rows[b["t"]] = "%s,%.2f,%.2f,%.2f,%.2f" % (b["t"], b["o"], b["h"], b["l"], b["c"])
+    with open(BARS_FILE, "w") as f:
+        f.write("t,o,h,l,c\n")
+        for t in sorted(rows):
+            f.write(rows[t] + "\n")
+
+
 def load_state():
     try:
         with open(STATE_FILE) as f:
@@ -223,6 +256,8 @@ def main():
                 if filled(z, bars[k]):
                     seen.add(z["id"])
                     skipped += 1
+                    e_, s_, t_, _ = levels(z, av)
+                    log_signal(z, bars[k], "skipped", e_, s_, t_, av)
                 else:
                     hits.append((z, k))
                 break
@@ -250,6 +285,7 @@ def main():
         if notify(msg):
             seen.add(z["id"])
             sent += 1
+            log_signal(z, bar, "sent", entry, sl, tp, av)
         time.sleep(SEND_GAP)
 
     rest = len(hits) - min(len(hits), MAX_ALERTS)
@@ -258,6 +294,7 @@ def main():
 
     st["notified"] = sorted(seen)
     save_state(st)
+    save_bars(bars)
     print("checked %d bars, %d hits, %d sent, %d skipped(filled)"
           % (len(bars), len(hits), sent, skipped))
     return 0
